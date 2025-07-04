@@ -1,0 +1,8 @@
+streamlit
+pandas
+instaloader
+python-dotenv
+openai
+moviepy
+langdetect
+requests
