@@ -1,5 +1,3 @@
-# app.py
-
 import os
 import io
 import tempfile
@@ -11,24 +9,22 @@ import requests
 from moviepy.editor import VideoFileClip
 from langdetect import detect
 
-# ---- ENV / Secrets
+# Load API key from Streamlit secrets or .env for local dev
 if os.path.exists('.env'):
     load_dotenv('.env')
-
 OPENAI_API_KEY = st.secrets.get("OPENAI_API_KEY", os.environ.get("OPENAI_API_KEY", None))
 if not OPENAI_API_KEY:
-    st.error("No OpenAI API key found. Set in .streamlit/secrets.toml as OPENAI_API_KEY.")
+    st.error("No OpenAI API key found. Add to .streamlit/secrets.toml as OPENAI_API_KEY.")
     st.stop()
 
-# --- Whisper API (using OpenAI API for simplicity, switch to WhisperX if you want alignment)
 import openai
 openai.api_key = OPENAI_API_KEY
 
-# --- UI ----
 st.title("Instagram Video Hook Analyzer")
 
-st.markdown("Upload Instagram usernames (one per line) or a CSV. The app scrapes videos (100k+ likes), transcribes audio, and classifies the video hook.")
+st.markdown("Upload Instagram usernames or CSV, set your filters, and analyze high-performing IG videos.")
 
+# ---- Inputs ----
 input_method = st.radio("Input method", ["Text", "CSV upload"])
 if input_method == "Text":
     usernames = st.text_area("Instagram usernames (one per line)", height=100)
@@ -41,46 +37,51 @@ else:
     else:
         usernames = []
 
+st.subheader("Custom Filters")
+min_followers = st.number_input("Minimum Followers", min_value=0, value=0)
+min_likes = st.number_input("Minimum Likes (per video)", min_value=0, value=100000)
+min_views = st.number_input("Minimum Video Views (per video)", min_value=0, value=0)
+
 if not usernames:
     st.info("Add at least one username to begin.")
     st.stop()
 
-st.write(f"Usernames loaded: {', '.join(usernames)}")
-
 if "results" not in st.session_state:
     st.session_state.results = []
 
-# --- Core logic ---
-def scrape_instagram_videos(username, min_likes=100_000, max_videos=10):
-    """Get recent video posts with >= min_likes for a username."""
+# ---- Scrape logic ----
+def scrape_instagram_videos(username, min_followers=0, min_likes=100_000, min_views=0, max_videos=10):
+    """Scrape IG video posts with filtering on followers, likes, views."""
     try:
-        L = instaloader.Instaloader(
-            download_video_thumbnails=False,
-            save_metadata=False,
-            download_comments=False,
-            download_geotags=False,
-            download_pictures=False,
-            compress_json=False,
-            quiet=True
-        )
+        L = instaloader.Instaloader(quiet=True)
         profile = instaloader.Profile.from_username(L.context, username)
+        # Profile filter
+        if profile.followers < min_followers:
+            st.info(f"Skipping {username}: only {profile.followers} followers (min {min_followers})")
+            return [], profile.followers
         videos = []
         for post in profile.get_posts():
-            if post.is_video and post.likes >= min_likes:
-                videos.append({
-                    "video_url": post.video_url,
-                    "likes": post.likes,
-                    "shortcode": post.shortcode
-                })
-                if len(videos) >= max_videos:
-                    break
-        return videos
+            if not post.is_video:
+                continue
+            if post.likes < min_likes:
+                continue
+            views = getattr(post, 'video_view_count', 0) or 0
+            if views < min_views:
+                continue
+            videos.append({
+                "video_url": post.video_url,
+                "likes": post.likes,
+                "views": views,
+                "shortcode": post.shortcode
+            })
+            if len(videos) >= max_videos:
+                break
+        return videos, profile.followers
     except Exception as e:
         st.warning(f"Error scraping {username}: {e}")
-        return []
+        return [], None
 
 def download_video(url):
-    """Download video from URL to memory."""
     response = requests.get(url, stream=True)
     if response.status_code == 200:
         return io.BytesIO(response.content)
@@ -88,7 +89,6 @@ def download_video(url):
         raise Exception("Failed to download video.")
 
 def extract_audio_from_video(video_bytes):
-    """Extract audio as wav bytes using moviepy."""
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_video:
         tmp_video.write(video_bytes.read())
         tmp_video.flush()
@@ -103,7 +103,6 @@ def extract_audio_from_video(video_bytes):
             return io.BytesIO(audio_bytes)
 
 def transcribe_audio_whisper(audio_bytes):
-    """Transcribe audio using OpenAI Whisper API."""
     audio_bytes.seek(0)
     transcript = openai.audio.transcriptions.create(
         model="whisper-1",
@@ -113,7 +112,6 @@ def transcribe_audio_whisper(audio_bytes):
     return transcript
 
 def extract_hook_text(transcript, n_words=30):
-    """Extract the hook (first n words, approximates 3–8 seconds)."""
     words = transcript.split()
     return " ".join(words[:n_words])
 
@@ -124,7 +122,6 @@ def detect_language(text):
         return "unknown"
 
 def classify_hook(hook_text):
-    """Simple LLM prompt-based classifier."""
     system_prompt = "You are an expert at classifying video hooks for viral social content. Given a hook, classify it as: Question, Bold Claim, Problem-Solution, Data Drop, Intrigue, Promise, Other. Return just the category."
     user_prompt = f'Hook: "{hook_text}"\nCategory:'
     try:
@@ -138,22 +135,25 @@ def classify_hook(hook_text):
             temperature=0
         )
         return resp.choices[0].message.content.strip()
-    except Exception as e:
+    except Exception:
         return "Unknown"
 
-# --- Main button and pipeline
+# ---- Main pipeline ----
 if st.button("Run Analysis"):
     results = []
     progress = st.progress(0, text="Starting...")
-
     total = len(usernames)
     for idx, username in enumerate(usernames):
         st.info(f"Processing {username}...")
-        videos = scrape_instagram_videos(username)
+        videos, followers = scrape_instagram_videos(
+            username,
+            min_followers=min_followers,
+            min_likes=min_likes,
+            min_views=min_views
+        )
         for vid in videos:
-            st.write(f"Transcribing video with {vid['likes']} likes...")
-
             try:
+                st.write(f"Transcribing video ({vid['likes']} likes, {vid['views']} views)...")
                 video_bytes = download_video(vid['video_url'])
                 audio_bytes = extract_audio_from_video(video_bytes)
                 transcript = transcribe_audio_whisper(audio_bytes)
@@ -165,8 +165,10 @@ if st.button("Run Analysis"):
                 hook_pattern = classify_hook(hook_text)
                 results.append({
                     "Username": username,
+                    "Followers": followers,
                     "Video URL": vid['video_url'],
                     "Likes": vid['likes'],
+                    "Views": vid['views'],
                     "Transcript": transcript,
                     "Hook Text": hook_text,
                     "Hook Pattern": hook_pattern,
@@ -175,9 +177,7 @@ if st.button("Run Analysis"):
             except Exception as e:
                 st.warning(f"Error processing video: {e}")
                 continue
-
         progress.progress((idx + 1) / total, text=f"Done {idx + 1}/{total}")
-
     if results:
         df = pd.DataFrame(results)
         st.session_state.results = df
@@ -185,16 +185,15 @@ if st.button("Run Analysis"):
     else:
         st.warning("No qualifying videos found.")
 
-# --- Results table
+# ---- Results table and download ----
 if st.session_state.get("results", None) is not None and not st.session_state.results.empty:
     st.dataframe(
-        st.session_state.results[["Username", "Likes", "Hook Text", "Hook Pattern", "Transcript", "Video URL", "View Video"]],
+        st.session_state.results[
+            ["Username", "Followers", "Likes", "Views", "Hook Text", "Hook Pattern", "Transcript", "Video URL", "View Video"]
+        ],
         use_container_width=True
     )
-
-    # --- Export buttons
     csv = st.session_state.results.to_csv(index=False)
     json = st.session_state.results.to_json(orient="records")
-
     st.download_button("Download CSV", csv, file_name="results.csv")
     st.download_button("Download JSON", json, file_name="results.json")
